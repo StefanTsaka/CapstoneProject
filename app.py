@@ -1,113 +1,169 @@
-import os, json, re, time, datetime as dt
+# grant_analyzer.py  – Grant-Fit Dashboard for CT RISE
+# • Feasibility column right after Match %
+# • Index in table starts at 1
+# • Honest 250-word analysis + PDF download
+# • One-click Clear Table
+
+import os, json, re, time, datetime as dt, io
 import pandas as pd, streamlit as st, openai
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
 
-# ––––– CONFIG –––––
-SEARCH_MODEL = "gpt-4o-mini-search-preview"   # web-search capable
+# ───────── CONFIG
+SEARCH_MODEL = "gpt-4o-mini-search-preview"
 CHAT_MODEL   = "gpt-3.5-turbo"
 EMB_MODEL    = "text-embedding-ada-002"
-
-NEEDED   = 10    # rows in final table
-ASK_FOR  = 20    # ask for extras
-MAX_TRY  = 6     # prompt retries
-API_RETRY= 4
-SLEEP    = 2     # sec back-off
+CSV_PATH     = "grants_history.csv"
+API_RETRY    = 4
+BACKOFF      = 2
+COLS = ["Title", "Match%", "Feasibility", "Amount", "Deadline",
+        "Sponsor", "Grant Summary", "URL", "Recommendation"]
 
 MISSION = (
-    "The San Francisco-Marin Food Bank's mission is to end hunger in San Francisco and Marin by distributing food and addressing the root causes of hunger. We envision a just and equitable society that nurtures a resilient community. We envision a community where everyone will have access to nutritious food of their choosing and will be uplifted by a network of support. We believe that food is a basic human right."
+    "The Connecticut RISE Network empowers public high schools with data-driven strategies "
+    "and personalised support to improve student outcomes and promote post-secondary success, "
+    "especially for Black, Latinx, and low-income youth."
 )
 
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# ───────── OPENAI
+load_dotenv(); openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# ––––– HELPERS –––––
 def retry(fn):
     def wrap(*a, **k):
         for i in range(API_RETRY):
-            try: return fn(*a, **k)
-            except openai.RateLimitError: time.sleep(SLEEP*(i+1))
-        st.error("OpenAI rate-limit — try later."); st.stop()
+            try:   return fn(*a, **k)
+            except openai.error.RateLimitError: time.sleep(BACKOFF*(i+1))
+        st.error("OpenAI rate-limit; try later."); st.stop()
     return wrap
 
 @retry
-def ask(model, msgs):                 # chat wrapper
-    return openai.chat.completions.create(model=model, messages=msgs)
+def chat(model, msgs, **kw): return openai.chat.completions.create(model=model, messages=msgs, **kw)
 
 @retry
-def emb(text):                        # embedding wrapper
-    return openai.embeddings.create(model=EMB_MODEL, input=text).data[0].embedding
+def embed(txt): return openai.embeddings.create(model=EMB_MODEL, input=txt).data[0].embedding
 
-# ––––– 1 · FETCH & DEDUP –––––
-def fetch_unique():
-    prompt = (
-        f"search: Provide {ASK_FOR} CURRENT US grant opportunities (Apply-Now link included) "
-        f"for nonprofits in high-school education, youth equity, or college readiness. "
-        f"Exclude any grant whose deadline is before {dt.date.today()}. "
-        "Return ONLY a JSON array. Keys: title, sponsor, amount, deadline (YYYY-MM-DD "
-        "or 'rolling'), url (direct apply link), summary."
-    )
-    titles_seen, urls_seen, rows = set(), set(), []
-    for _ in range(MAX_TRY):
-        raw = ask(SEARCH_MODEL, [{"role":"user","content":prompt}]).choices[0].message.content
-        try: data = json.loads(raw)
-        except json.JSONDecodeError:
-            m = re.search(r"\[.*\]", raw, re.S); data = json.loads(m.group()) if m else []
+# ───────── CSV I/O
+def load_hist():
+    df = pd.read_csv(CSV_PATH) if os.path.exists(CSV_PATH) else pd.DataFrame(columns=COLS)
+    return df.reindex(columns=COLS)
 
-        today = dt.date.today()
-        for d in data:
-            g = {k: d.get(k, "N/A") for k in
-                 ("title","sponsor","amount","deadline","url","summary")}
-            # future deadline check
-            future = True
-            dl = g["deadline"].lower()
-            if dl != "rolling":
-                try:  future = dt.datetime.strptime(dl[:10],"%Y-%m-%d").date() >= today
-                except: future = False
-            # de-dupe by title OR url
-            tkey = g["title"].strip().lower(); ukey = g["url"].strip().lower()
-            if future and tkey not in titles_seen and ukey not in urls_seen:
-                rows.append(g); titles_seen.add(tkey); urls_seen.add(ukey)
-            if len(rows) == NEEDED: return rows
-    return rows   # may be <10 after retries
+def save_hist(df): df.reindex(columns=COLS).to_csv(CSV_PATH, index=False)
 
-# ––––– 2 · RANK & ADD “WHY” –––––
-def make_table(raw):
-    df = pd.DataFrame(raw)
-    base_vec = emb(MISSION)
-    df["Match%"] = (df.summary.apply(lambda s:
-        cosine_similarity([emb(s)], [base_vec])[0][0]*100).round(1))
-    df = df.sort_values("Match%", ascending=False).reset_index(drop=True)
+# ───────── GRANT SCRAPER
+def scrape(url:str):
+    prm = (f"search: Visit {url} and return JSON with keys "
+           "{title,sponsor,amount,deadline (YYYY-MM-DD or 'rolling'), summary}. "
+           "Use 'N/A' for unknown. Respond ONLY with JSON.")
+    raw = chat(SEARCH_MODEL,[{"role":"user","content":prm}]).choices[0].message.content
+    m   = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", raw, re.S) or re.search(r"(\{.*?\}|\[.*?\])", raw, re.S)
+    if not m: return None
+    obj = json.loads(m.group(1))
+    if isinstance(obj, list): obj = obj[0]
+    obj["url"] = url
+    return {k: obj.get(k, "N/A") for k in ("title","sponsor","amount","deadline","summary","url")}
 
-    whys=[]
-    for _, r in df.iterrows():
-        q = (f'In one sentence: why does the grant "{r.title}" align with '
-             f'the mission "{MISSION}"?')
-        whys.append(ask(CHAT_MODEL,[{"role":"user","content":q}])
-                     .choices[0].message.content.strip())
-    df["Why It Fits"] = whys
+def deadline_ok(dl:str):
+    if dl.lower()=="rolling": return True
+    try: return dt.datetime.strptime(dl[:10], "%Y-%m-%d").date() >= dt.date.today()
+    except: return False
 
-    # reorder & rename columns
-    return df[["title","Match%","amount","deadline",
-               "sponsor","summary","url","Why It Fits"]].rename(columns={
-        "title":"Title","amount":"Amount","deadline":"Deadline",
-        "sponsor":"Sponsor","summary":"Grant Summary","url":"URL"
-    })
+# ───────── PDF MAKER
+def make_pdf(title:str, text:str)->bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, leftMargin=40, rightMargin=40,
+                            topMargin=40, bottomMargin=40)
+    styles = getSampleStyleSheet()
+    doc.build([
+        Paragraph(f"<b>{title}</b>", styles["Title"]),
+        Spacer(1, 12),
+        Paragraph(text.replace("\n", "<br/>"), styles["BodyText"])
+    ])
+    return buf.getvalue()
 
-# ––––– STREAMLIT APP –––––
-st.title("Food Bank Capstone Project (Grant Matcher for SF Food Bank – GPT-4o Search)")
-st.write("> **Mission:**", MISSION)
+def feasibility(match: float) -> str:
+    return "High" if match >= 75 else "Medium" if match >= 50 else "Low"
 
-if st.button("Generate & Rank 10 Grants", type="primary"):
-    with st.spinner("GPT-4o searching web and compiling unique future-deadline grants …"):
-        grants = fetch_unique()
-        if len(grants) < NEEDED:
-            st.error(f"Only found {len(grants)} unique future-deadline grants. Click again.")
+# ───────── STREAMLIT UI
+st.set_page_config("CT RISE Grant Analyzer", layout="wide")
+st.title("CT RISE — Grant Fit Analyzer")
+st.write("**Mission:**", MISSION)
+
+if "tbl" not in st.session_state:           st.session_state.tbl  = load_hist()
+if "latest_title" not in st.session_state:  st.session_state.latest_title  = None
+if "latest_report" not in st.session_state: st.session_state.latest_report = None
+if "latest_pdf" not in st.session_state:    st.session_state.latest_pdf    = None
+
+url = st.text_input("Paste grant application URL")
+
+# ---------- ANALYZE ----------
+if st.button("Analyze Grant") and url.strip():
+    with st.spinner("Analyzing…"):
+        g = scrape(url.strip())
+        if not g:
+            st.error("Could not parse that URL.")
+        elif not deadline_ok(g["deadline"]):
+            st.warning("Deadline passed — skipped.")
         else:
-            st.session_state["tbl"] = make_table(grants)
-            st.success("Table ready!")
+            df = st.session_state.tbl
+            if ((df["URL"].str.lower()==g["url"].lower()).any() or
+                (df["Title"].str.lower()==g["title"].lower()).any()):
+                st.info("Grant already in table.")
+            else:
+                match = cosine_similarity([embed(g["summary"])],[embed(MISSION)])[0][0]*100
+                feas  = feasibility(match)
+                short = chat(
+                    CHAT_MODEL,
+                    [{"role":"user","content":f'One sentence: why is "{g["title"]}" a fit (or not) for {MISSION}?'}],
+                    temperature=0.3).choices[0].message.content.strip()
+                long_prompt = (
+                    f"You are an objective grant advisor.\n\nMission:\n{MISSION}\n\n"
+                    f"Grant details:\nTitle: {g['title']}\nSponsor: {g['sponsor']}\n"
+                    f"Amount: {g['amount']}\nDeadline: {g['deadline']}\nSummary: {g['summary']}\n\n"
+                    "Write about 250 words covering:\n"
+                    "1. Alignment with mission & population\n"
+                    "2. Strengths/opportunities\n"
+                    "3. Gaps/disqualifiers (be blunt)\n"
+                    f"4. Your feasibility rating: {feas}."
+                )
+                full = chat(CHAT_MODEL,[{"role":"user","content":long_prompt}],temperature=0.7)\
+                       .choices[0].message.content.strip()
+                pdf = make_pdf(g["title"], full)
+                new = pd.DataFrame([{
+                    "Title": g["title"], "Match%": round(match,1), "Feasibility": feas,
+                    "Amount": g["amount"], "Deadline": g["deadline"],
+                    "Sponsor": g["sponsor"], "Grant Summary": g["summary"],
+                    "URL": g["url"], "Recommendation": short
+                }])
+                st.session_state.tbl = pd.concat([df, new], ignore_index=True)\
+                                          .sort_values("Match%", ascending=False, ignore_index=True)
+                save_hist(st.session_state.tbl)
+                st.session_state.latest_title  = g["title"]
+                st.session_state.latest_report = full
+                st.session_state.latest_pdf    = pdf
+                st.success("Grant added & analysis ready!")
 
-if "tbl" in st.session_state:
-    st.dataframe(st.session_state["tbl"], use_container_width=True)
-else:
-    st.caption("Press the rocket to generate your ranked list.")
+# ---------- LATEST ANALYSIS ----------
+if st.session_state.latest_report:
+    st.subheader(f"Detailed Analysis — {st.session_state.latest_title}")
+    st.write(st.session_state.latest_report)
+    st.download_button("Download analysis (PDF)",
+                       st.session_state.latest_pdf,
+                       f"{st.session_state.latest_title}_analysis.pdf",
+                       mime="application/pdf")
+
+# ---------- TABLE (index starts at 1)
+st.subheader("Analyzed Grants (saved across sessions)")
+display_df = st.session_state.tbl.reindex(columns=COLS).copy()
+display_df.index = range(1, len(display_df) + 1)
+st.dataframe(display_df, use_container_width=True)
+
+# ---------- CLEAR TABLE ----------
+if st.button("🗑️ Clear table"):
+    st.session_state.tbl = pd.DataFrame(columns=COLS)
+    save_hist(st.session_state.tbl)
+    st.session_state.latest_title = st.session_state.latest_report = st.session_state.latest_pdf = None
+    st.rerun()
+
